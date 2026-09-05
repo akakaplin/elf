@@ -1,0 +1,713 @@
+:root {
+  --bg: #0d1116;
+  --panel: #12161c;
+  --panel-2: #161c24;
+  --line: #232c37;
+  --line-soft: #1b222b;
+  --text: #dbe3ec;
+  --muted: #7e8b9b;
+  --dim: #5a6674;
+  --accent: #ffd43b;
+  --ok: #69db7c;
+  --warn: #ff922b;
+  --err: #ff6b6b;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow: hidden;
+}
+
+.fatal {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 268px 1fr;
+  height: 100%;
+}
+
+/* -------------------------------------------------------------- collapse --- */
+
+/* Collapsed, the panel narrows to a rail instead of disappearing: a button
+   floating over the chart would land on the timeline's series labels, and the
+   rail also keeps the health dot in view. */
+.app.collapsed { grid-template-columns: 28px 1fr; }
+
+.sidebar.rail {
+  align-items: center;
+  padding-top: 8px;
+  overflow: hidden;
+}
+
+.reveal {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 7px 0;
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.reveal:hover { color: var(--text); }
+
+.reveal .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+
+.reveal .dot.off {
+  background: var(--err);
+  box-shadow: 0 0 8px var(--err);
+  animation: dot-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal .dot.off { animation: none; }
+}
+/* ------------------------------------------------------------- sidebar --- */
+
+.sidebar {
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar { position: relative; }
+
+.brand {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.brand .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+  flex: none;
+  transition: background 120ms linear, box-shadow 120ms linear;
+}
+
+/* The heartbeat stopped answering. Pulsed rather than merely recoloured, so a
+   server that dies while the page sits idle catches the eye. */
+.brand .dot.off {
+  background: var(--err);
+  box-shadow: 0 0 8px var(--err);
+  animation: dot-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes dot-pulse {
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .brand .dot.off { animation: none; }
+}
+
+.brand .cog {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.brand .cog:hover { color: var(--text); border-color: var(--line); }
+
+.brand .cog.on {
+  color: var(--accent);
+  border-color: var(--line);
+  background: var(--panel-2);
+}
+
+.settings {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 8px;
+  right: 8px;
+  z-index: 20;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.6);
+}
+
+.settings .section:last-child { border-bottom: none; }
+
+.brand .sub {
+  flex: 1;
+  min-width: 0;
+  font-weight: 400;
+  font-size: 10px;
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: right;
+  direction: rtl;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The path is shown tail-first and clipped, so hovering has to reveal the whole
+   thing. A panel rather than a `title`: the native tooltip renders one long
+   line that the OS truncates, and it inherits nothing of the rtl trick above,
+   so a long path came out both cut and re-ordered. Bounded to the sidebar's
+   width like `.settings`, since the sidebar scrolls and would clip anything
+   wider. */
+.brand .path-tip {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 8px;
+  right: 8px;
+  z-index: 30;
+  padding: 7px 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.6);
+  color: var(--text);
+  font-weight: 400;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  letter-spacing: 0;
+  direction: ltr;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 90ms linear, visibility 0s linear 90ms;
+}
+
+.brand .sub:hover + .path-tip,
+.brand .sub:focus-visible + .path-tip,
+.brand .path-tip:hover {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.section { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.count { font-family: ui-monospace, Menlo, monospace; color: var(--dim); }
+.count.full { color: var(--accent); }
+
+.filter {
+  width: 100%;
+  padding: 5px 8px;
+  margin-bottom: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.filter:focus { outline: 1px solid var(--dim); border-color: var(--dim); }
+
+.channels { max-height: 42vh; overflow-y: auto; margin: -2px -4px 8px; padding: 0 4px; }
+
+.series + .series { margin-top: 9px; }
+
+.series-head {
+  display: flex;
+  justify-content: space-between;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--muted);
+  padding: 3px 2px;
+  border-bottom: 1px solid var(--line-soft);
+  margin-bottom: 3px;
+}
+
+.series-head .rows { color: var(--dim); }
+
+/* The whole row is the control -- click the name to toggle the channel. */
+.chan {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 3px 6px;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chan:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
+.chan:focus-visible { outline: 1px solid var(--dim); outline-offset: -1px; }
+
+.chan.on {
+  background: #1b2632;
+  color: var(--text);
+}
+
+.chan.on:hover { background: #223041; }
+.chan.on .name { font-weight: 650; }
+.chan.off .name { text-decoration: line-through; color: var(--muted); }
+.chan.demoted .name { color: var(--dim); }
+
+.chan:disabled { opacity: 0.32; cursor: not-allowed; }
+
+.swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  border: 1px solid var(--line);
+  background: transparent;
+  flex: none;
+}
+
+.chan .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.chan .dtype { color: var(--dim); font-size: 10px; }
+
+.seg { display: flex; gap: 4px; }
+
+.seg button, .toolbar button, .ghost {
+  flex: 1;
+  padding: 4px 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.seg button:hover, .toolbar button:hover, .ghost:hover:not(:disabled) {
+  border-color: var(--dim); color: var(--text);
+}
+
+.seg button.on, .toolbar button.on {
+  background: #24303e; color: var(--text); border-color: #35485c;
+}
+
+.ghost { width: 100%; }
+.ghost:disabled { opacity: 0.4; cursor: default; }
+
+.slider { display: block; margin-top: 9px; font-size: 11.5px; color: var(--muted); }
+.slider span { display: block; margin-bottom: 4px; }
+.slider b { color: var(--text); font-family: ui-monospace, Menlo, monospace; }
+.slider input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+.slider select {
+  width: 100%;
+  padding: 4px 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+}
+
+.check {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 9px; font-size: 11.5px; color: var(--muted); cursor: pointer;
+}
+
+.check input { accent-color: var(--accent); margin: 0; }
+
+.note { margin: 8px 0 0; font-size: 10.5px; line-height: 1.5; color: var(--dim); }
+
+/* ---------------------------------------------------------------- main --- */
+
+.main { display: flex; flex-direction: column; min-width: 0; height: 100%; }
+
+.timeline {
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  cursor: crosshair;
+}
+
+.timeline canvas { display: block; touch-action: none; }
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.toolbar button { flex: none; min-width: 30px; }
+.toolbar .divider { width: 1px; height: 16px; background: var(--line); margin: 0 4px; }
+.toolbar .spacer { flex: 1; }
+
+.toolbar .hint {
+  font-size: 10.5px;
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+
+.stack {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.empty {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--dim);
+}
+
+.chart {
+  position: relative;
+  flex: 1 1 0;
+  min-height: 132px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.chart:last-child { border-bottom: none; }
+.chart canvas { display: block; touch-action: none; cursor: crosshair; }
+
+.brush {
+  position: absolute;
+  top: 10px;
+  bottom: 8px;
+  background: rgba(255, 212, 59, 0.13);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+}
+
+.legend {
+  position: absolute;
+  top: 4px;
+  left: 72px;
+  right: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  pointer-events: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+}
+
+.legend .range {
+  color: var(--dim);
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: rgba(13, 17, 22, 0.75);
+}
+
+/* The legend is the only clickable part of the overlay; everywhere else the
+   pointer belongs to the canvas underneath. */
+.legend .item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: rgba(13, 17, 22, 0.72);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.legend .item:hover { border-color: var(--line); color: var(--text); }
+.legend .item:focus-visible { outline: 1px solid var(--dim); outline-offset: 1px; }
+
+.legend .item.off { opacity: 0.4; }
+.legend .item.off .lbl { text-decoration: line-through; }
+
+.legend i { width: 8px; height: 2px; border-radius: 1px; display: inline-block; flex: none; }
+.legend .lbl em { color: var(--dim); font-style: normal; margin-right: 4px; }
+.legend b { color: var(--text); font-weight: 600; }
+.legend u { color: var(--dim); text-decoration: none; }
+
+/* -------------------------------------------------------------- status --- */
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
+.status .k {
+  color: var(--dim);
+  text-transform: uppercase;
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+}
+
+.status .v { color: var(--text); }
+.status .v .arrow { color: var(--dim); padding: 0 6px; }
+.status .v.dim { color: var(--dim); }
+.status .spacer { flex: 1; }
+.status .err { color: var(--err); }
+.status .v.capped { color: var(--warn); }
+.status.busy .v.dim { color: var(--accent); }
+
+.status .mode.raw { color: var(--ok); }
+.status .mode.agg { color: var(--warn); }
+.status .mode.rawagg { color: var(--accent); }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #26303c; border-radius: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* -------------------------------------------------------------- formulas --- */
+
+.formulas .synth {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 4px;
+  border-radius: 5px;
+}
+
+.formulas .synth:hover { background: var(--panel-2); }
+.formulas .synth .swatch { margin-top: 3px; flex: none; }
+
+.formulas .synth .body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.formulas .synth .name { color: var(--text); }
+
+.formulas .synth .expr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+.formulas .synth .why {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  font-size: 10px;
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.formulas .synth .why.err { color: var(--err); font-family: inherit; font-size: 11px; }
+.formulas .synth .bind em { font-style: normal; color: var(--muted); padding-right: 4px; }
+.formulas .synth.bad .swatch { border: 1px dashed var(--err); background: transparent; }
+
+.mini {
+  flex: none;
+  width: 20px; height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mini:hover { color: var(--text); border-color: var(--line); background: var(--panel); }
+
+/* ---- editor ---- */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px;
+  margin: 4px 0;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.editor input {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.editor input:focus { outline: none; border-color: var(--muted); }
+
+.editor .f-expr {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--accent);
+}
+
+.editor .f-ref {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+}
+
+.editor .f-ref em { padding-top: 5px; }
+
+.editor .f-ref em {
+  flex: none;
+  width: 12px;
+  font-style: normal;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.editor .f-why {
+  color: var(--warn);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.editor .f-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.editor .f-actions .ghost { flex: 1; }
+.ghost.tight { padding: 4px 6px; font-size: 11px; margin: 0; }
+.ghost.go:not(:disabled) { color: var(--ok); border-color: var(--ok); }
+
+/* A computed channel is marked in the legend rather than qualified by a series
+   name it does not have. */
+.lbl.syn em { color: var(--accent); }
+
+/* ---- channel search ---- */
+
+.picker {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.picker .p-input.unset::placeholder { color: var(--dim); }
+.picker .p-input::placeholder { color: var(--muted); }
+
+/* What is currently bound, shown under the search box so typing a new query
+   never makes you forget what the slot already points at. */
+.picker .p-chosen {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--ok);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+/* In the flow rather than floating: the sidebar scrolls, and an absolutely
+   positioned list would be clipped by it. */
+.picker .p-list {
+  max-height: 168px;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.picker .p-opt {
+  display: block;
+  width: 100%;
+  padding: 3px 6px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker .p-opt.on { background: var(--panel-2); color: var(--text); }
+.picker .p-opt.cur { color: var(--ok); }
+
+.picker .p-none {
+  padding: 5px 6px;
+  color: var(--dim);
+  font-size: 10px;
+}

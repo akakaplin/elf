@@ -1,0 +1,228 @@
+//! Connection handling and catalog discovery.
+//!
+//! Everything here reads the orc parquet store as it sits on disk. There is no
+//! import step and no derived files: each series becomes a DuckDB view over
+//! `series/<name>/**/*.parquet`, exactly like the `view.sql` orc writes next to
+//! the data, and every query in `query.rs` hits those views directly.
+
+use anyhow::{anyhow, Context, Result};
+use duckdb::Connection;
+use serde::Serialize;
+use std::{
+    path::Path,
+    sync::Mutex,
+};
+
+const MAX_IDLE: usize = 8;
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Channel {
+    /// `<series>:<field>`
+    pub id: String,
+    pub series: String,
+    pub field: String,
+    pub dtype: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SeriesInfo {
+    pub name: String,
+    pub rows: i64,
+    pub t_min: Option<i64>,
+    pub t_max: Option<i64>,
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Catalog {
+    pub data_dir: String,
+    pub series: Vec<SeriesInfo>,
+    pub t_min: Option<i64>,
+    pub t_max: Option<i64>,
+}
+
+pub struct Db {
+    root: Mutex<Connection>,
+    idle: Mutex<Vec<Connection>>,
+    pub catalog: Catalog,
+}
+
+/// A checked-out connection that returns itself to the pool on drop.
+pub struct Lease<'a> {
+    conn: Option<Connection>,
+    db: &'a Db,
+}
+
+impl std::ops::Deref for Lease<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("lease used after drop")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let mut idle = self.db.idle.lock().unwrap();
+            if idle.len() < MAX_IDLE {
+                idle.push(conn);
+            }
+        }
+    }
+}
+
+impl Db {
+    /// Opens an in-memory DuckDB, defines one view per series directory, and
+    /// probes each view for its columns and time bounds.
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let data_dir = data_dir
+            .canonicalize()
+            .with_context(|| format!("data dir not found: {}", data_dir.display()))?;
+        let series_dir = data_dir.join("series");
+        if !series_dir.is_dir() {
+            return Err(anyhow!("no series/ directory under {}", data_dir.display()));
+        }
+
+        let conn = Connection::open_in_memory().context("open duckdb")?;
+        conn.execute_batch("SET TimeZone='UTC';")?;
+
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&series_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            names.push(name);
+        }
+        names.sort();
+
+        let mut series = Vec::new();
+        for name in names {
+            let glob = series_dir.join(&name).join("**").join("*.parquet");
+            let sql = format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT * FROM read_parquet('{}', hive_partitioning = 1, union_by_name = 1)",
+                quote_ident(&name),
+                escape_literal(&glob.to_string_lossy()),
+            );
+            if let Err(e) = conn.execute_batch(&sql) {
+                eprintln!("skipping series {name}: {e}");
+                continue;
+            }
+            match describe(&conn, &name) {
+                Ok(info) => series.push(info),
+                Err(e) => eprintln!("skipping series {name}: {e}"),
+            }
+        }
+
+        if series.is_empty() {
+            return Err(anyhow!("no readable series under {}", series_dir.display()));
+        }
+
+        let t_min = series.iter().filter_map(|s| s.t_min).min();
+        let t_max = series.iter().filter_map(|s| s.t_max).max();
+
+        Ok(Db {
+            root: Mutex::new(conn),
+            idle: Mutex::new(Vec::new()),
+            catalog: Catalog {
+                data_dir: data_dir.to_string_lossy().into_owned(),
+                series,
+                t_min,
+                t_max,
+            },
+        })
+    }
+
+    pub fn lease(&self) -> Result<Lease<'_>> {
+        if let Some(conn) = self.idle.lock().unwrap().pop() {
+            return Ok(Lease {
+                conn: Some(conn),
+                db: self,
+            });
+        }
+        // Clones share the same in-memory database, so the views and DuckDB's
+        // parquet metadata cache are shared across the pool.
+        let conn = self.root.lock().unwrap().try_clone()?;
+        conn.execute_batch("SET TimeZone='UTC';")?;
+        Ok(Lease {
+            conn: Some(conn),
+            db: self,
+        })
+    }
+
+    pub fn series(&self, name: &str) -> Option<&SeriesInfo> {
+        self.catalog.series.iter().find(|s| s.name == name)
+    }
+}
+
+fn describe(conn: &Connection, name: &str) -> Result<SeriesInfo> {
+    let ident = quote_ident(name);
+
+    let mut stmt = conn.prepare(&format!("DESCRIBE {ident}"))?;
+    let cols: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let channels = cols
+        .iter()
+        .filter(|(col, ty)| col != "ts" && is_numeric(ty))
+        .map(|(col, ty)| Channel {
+            id: format!("{name}:{col}"),
+            series: name.to_string(),
+            field: col.clone(),
+            dtype: ty.clone(),
+        })
+        .collect();
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT count(*), epoch_us(min(ts)), epoch_us(max(ts)) FROM {ident}"
+    ))?;
+    let (rows, t_min, t_max) = stmt.query_row([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<i64>>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+
+    Ok(SeriesInfo {
+        name: name.to_string(),
+        rows,
+        t_min,
+        t_max,
+        channels,
+    })
+}
+
+fn is_numeric(ty: &str) -> bool {
+    let ty = ty.to_ascii_uppercase();
+    ty.starts_with("DECIMAL")
+        || matches!(
+            ty.as_str(),
+            "DOUBLE"
+                | "FLOAT"
+                | "REAL"
+                | "TINYINT"
+                | "SMALLINT"
+                | "INTEGER"
+                | "BIGINT"
+                | "HUGEINT"
+                | "UTINYINT"
+                | "USMALLINT"
+                | "UINTEGER"
+                | "UBIGINT"
+                | "UHUGEINT"
+        )
+}
+
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+pub fn escape_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
