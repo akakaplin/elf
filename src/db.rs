@@ -7,15 +7,17 @@
 
 use anyhow::{anyhow, Context, Result};
 use duckdb::Connection;
-use serde::Serialize;
 use std::{
+    io::{self, Write},
     path::Path,
     sync::Mutex,
 };
 
+use crate::json::{Object, ToJson};
+
 const MAX_IDLE: usize = 8;
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Channel {
     /// `<series>:<field>`
     pub id: String,
@@ -24,7 +26,18 @@ pub struct Channel {
     pub dtype: String,
 }
 
-#[derive(Serialize, Clone, Debug)]
+impl ToJson for Channel {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field("id", &self.id)?
+            .field("series", &self.series)?
+            .field("field", &self.field)?
+            .field("dtype", &self.dtype)?
+            .end()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SeriesInfo {
     pub name: String,
     pub rows: i64,
@@ -33,12 +46,35 @@ pub struct SeriesInfo {
     pub channels: Vec<Channel>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+impl ToJson for SeriesInfo {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field("name", &self.name)?
+            .field("rows", &self.rows)?
+            .field("t_min", &self.t_min)?
+            .field("t_max", &self.t_max)?
+            .field("channels", &self.channels)?
+            .end()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Catalog {
     pub data_dir: String,
     pub series: Vec<SeriesInfo>,
     pub t_min: Option<i64>,
     pub t_max: Option<i64>,
+}
+
+impl Catalog {
+    /// Writes the catalog's fields into an object the caller has opened, so a
+    /// response can carry fields of its own alongside them.
+    pub fn write_fields<'a, W: Write>(&self, obj: Object<'a, W>) -> io::Result<Object<'a, W>> {
+        obj.field("data_dir", &self.data_dir)?
+            .field("series", &self.series)?
+            .field("t_min", &self.t_min)?
+            .field("t_max", &self.t_max)
+    }
 }
 
 pub struct Db {

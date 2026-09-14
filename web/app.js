@@ -8,7 +8,7 @@ import { checkHealth, getCatalog, getCoverage, loadWindow } from './api.js';
 import { buildAxis, fmtDelta, fmtDuration, fmtTime } from './timeaxis.js';
 import {
   drawChart, drawTimeline, PALETTE, PAD, sampleAt,
-  TIMELINE_AXIS, TIMELINE_LANE, TIMELINE_TOP,
+  TIMELINE_AXIS, TIMELINE_LANE, TIMELINE_LEFT, TIMELINE_TOP,
 } from './chart.js';
 import { channelExtent, describeRange, fmtValue, groupChannels, unionExtent } from './scales.js';
 import { compile, evalSegment, varNames } from './formula.js';
@@ -442,6 +442,7 @@ function App() {
           axis=${axis}
           coverage=${coverage}
           catalog=${catalog}
+          selected=${selected}
           view=${view}
           onWindow=${setWindow}
           onZoom=${zoomAround}
@@ -980,13 +981,32 @@ function Settings({ s, chartCount, onClose }) {
 
 // --------------------------------------------------------------- timeline ---
 
-function Timeline({ axis, coverage, catalog, view, onWindow, onZoom, hoverU }) {
+function Timeline({ axis, coverage, catalog, selected, view, onWindow, onZoom, hoverU }) {
   const [ref, size] = useMeasure();
   const canvasRef = useRef(null);
   const geomRef = useRef(null);
   const dragRef = useRef(null);
   const seriesOrder = catalog.series.map((s) => s.name);
-  const height = TIMELINE_TOP + seriesOrder.length * TIMELINE_LANE + TIMELINE_AXIS;
+
+  /// Only a series with a selected channel gets a lane, kept in catalog order.
+  /// With nothing selected the strip is just the time axis -- still enough to
+  /// move the window with.
+  const chosen = new Set(selected.map((id) => id.split(':')[0]));
+  const active = seriesOrder.filter((s) => chosen.has(s));
+
+  /// Folded, the strip keeps a single lane: every series adds a row, and with
+  /// enough of them the coverage overview pushes the charts down the page. One
+  /// lane is still enough to steer the window by.
+  const [folded, setFolded] = useState(false);
+  // Folding a single lane changes nothing, so the fold only takes with several.
+  const fold = folded && active.length > 1;
+  /// The lane the user chose while folded. Until they choose, it follows the
+  /// series of the first selected channel -- the one being looked at.
+  const [picked, setPicked] = useState(null);
+  const lead = selected.map((id) => id.split(':')[0]).find((s) => active.includes(s));
+  const current = active.includes(picked) ? picked : lead;
+  const lanes = fold ? [current] : active;
+  const height = TIMELINE_TOP + lanes.length * TIMELINE_LANE + TIMELINE_AXIS;
 
   useEffect(() => {
     if (!canvasRef.current || !size.width) return;
@@ -996,11 +1016,14 @@ function Timeline({ axis, coverage, catalog, view, onWindow, onZoom, hoverU }) {
       axis,
       coverage: coverage.series,
       seriesOrder,
+      lanes,
+      // Folded, the picker sits where the label would be drawn.
+      labels: !fold,
       viewU0: view.u0,
       viewU1: view.u1,
       hoverU,
     });
-  }, [size.width, height, axis, coverage, view, hoverU, seriesOrder.join()]);
+  }, [size.width, height, axis, coverage, view, hoverU, fold, seriesOrder.join(), lanes.join()]);
 
   const uAt = (e) => {
     const g = geomRef.current;
@@ -1067,6 +1090,27 @@ function Timeline({ axis, coverage, catalog, view, onWindow, onZoom, hoverU }) {
         })}
         onDblClick=${() => onWindow(0, axis.totalU)}
       />
+      ${fold && html`
+        <select
+          class="lane-pick"
+          style=${{ top: `${TIMELINE_TOP - 2}px`, width: `${TIMELINE_LEFT - 14}px` }}
+          value=${current}
+          onChange=${(e) => setPicked(e.target.value)}
+          title="Series shown while the strip is folded"
+          aria-label="Series shown while the strip is folded"
+        >
+          ${active.map((name) => html`<option key=${name} value=${name}>${name}</option>`)}
+        </select>
+      `}
+      ${active.length > 1 && html`
+        <button
+          type="button"
+          class="fold"
+          onClick=${() => setFolded((f) => !f)}
+          title=${fold ? 'Show every selected series' : 'Fold the strip to one series'}
+          aria-expanded=${!fold}
+        >${fold ? `▸ 1 of ${active.length}` : `▾ ${active.length} series`}</button>
+      `}
     </div>
   `;
 }

@@ -6,13 +6,7 @@ description = "Multi-channel viewer over a raw orc parquet time-series store"
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-clap = { version = "4", features = ["derive"] }
 duckdb = "1.10505.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
-tower-http = { version = "0.6", features = ["fs"] }
 
 # Size-tuned: 4.0 MB -> 1.9 MB. The heavy lifting is in libduckdb, which this
 # does not touch, so the only Rust-side hot path -- serialising a large raw

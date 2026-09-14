@@ -29,7 +29,7 @@ export const AXIS_H = 22;
 export const TIMELINE_TOP = 8;
 export const TIMELINE_LANE = 15; // 12px lane + 3px gap
 export const TIMELINE_AXIS = 26;
-const TIMELINE_LEFT = 128;
+export const TIMELINE_LEFT = 128;
 
 /// Bottom-axis labels are drawn cheapest-first with collision rejection, so a
 /// collapsed gap's "⋯ 7d" caption never lands on top of a time tick.
@@ -395,7 +395,10 @@ export function sampleAt(segments, id, u) {
 // ---------------------------------------------------------------- timeline --
 
 export function drawTimeline(canvas, spec) {
-  const { width, height, axis, coverage, seriesOrder, viewU0, viewU1, hoverU } = spec;
+  const {
+    width, height, axis, coverage, seriesOrder, viewU0, viewU1, hoverU,
+    lanes = seriesOrder, labels = true,
+  } = spec;
   const ctx = fitCanvas(canvas, width, height);
   const left = TIMELINE_LEFT;
   const plotW = Math.max(1, width - left - PAD.right);
@@ -429,14 +432,16 @@ export function drawTimeline(canvas, spec) {
     ctx.restore();
   }
 
-  // One lane per series showing where that series has rows.
+  // One lane per series showing where that series has rows. A lane keeps the
+  // colour of its place in the full order, so folding the strip down to one
+  // series does not repaint it.
   ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
   ctx.textBaseline = 'middle';
-  seriesOrder.forEach((name, i) => {
+  lanes.forEach((name, i) => {
     const y = rowsTop + i * TIMELINE_LANE;
     ctx.fillStyle = '#1a212a';
     ctx.fillRect(left, y, plotW, laneH);
-    ctx.fillStyle = PALETTE[i % PALETTE.length];
+    ctx.fillStyle = PALETTE[Math.max(0, seriesOrder.indexOf(name)) % PALETTE.length];
     ctx.globalAlpha = 0.85;
     for (const [a, b] of coverage[name] || []) {
       const x0 = xOf(axis.toU(a));
@@ -444,6 +449,7 @@ export function drawTimeline(canvas, spec) {
       ctx.fillRect(x0, y, Math.max(1, x1 - x0), laneH);
     }
     ctx.globalAlpha = 1;
+    if (!labels) return;
     ctx.fillStyle = C.text;
     ctx.textAlign = 'right';
     ctx.fillText(ellipsize(ctx, name, left - 14), left - 8, y + laneH / 2);

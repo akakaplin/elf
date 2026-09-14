@@ -2,20 +2,31 @@
 //! nothing is materialised, cached on disk, or precomputed.
 
 use anyhow::{anyhow, Result};
-use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 
 use crate::db::{quote_ident, Db};
+use crate::json::{Object, ToJson};
 
 // ---------------------------------------------------------------- coverage --
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Coverage {
     pub bucket_us: i64,
     /// Per series: the half-open [start, end) windows that actually hold rows.
     pub series: BTreeMap<String, Vec<[i64; 2]>>,
     /// Union across series -- what the timeline collapses gaps against.
     pub union: Vec<[i64; 2]>,
+}
+
+impl ToJson for Coverage {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field("bucket_us", &self.bucket_us)?
+            .field("series", &self.series)?
+            .field("union", &self.union)?
+            .end()
+    }
 }
 
 /// Finds the occupied stretches of wall-clock time by bucketing `ts` and
@@ -65,23 +76,31 @@ fn merge(buckets: &[i64], bucket_us: i64) -> Vec<[i64; 2]> {
 
 // -------------------------------------------------------------------- data --
 
-#[derive(Serialize, Debug, Clone, Default)]
+/// Arrays a mode does not use are left out of the JSON, not sent as `null`.
+#[derive(Debug, Clone, Default)]
 pub struct ChannelData {
     /// Present in `raw` mode: the actual recorded value.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub v: Option<Vec<Option<f64>>>,
     /// Present in `agg` mode: per-bucket envelope and endpoints.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub lo: Option<Vec<Option<f64>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub hi: Option<Vec<Option<f64>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub first: Option<Vec<Option<f64>>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub last: Option<Vec<Option<f64>>>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+impl ToJson for ChannelData {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field_if_some("v", &self.v)?
+            .field_if_some("lo", &self.lo)?
+            .field_if_some("hi", &self.hi)?
+            .field_if_some("first", &self.first)?
+            .field_if_some("last", &self.last)?
+            .end()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SeriesData {
     /// `raw` = every recorded point in the window, untouched.
     /// `agg` = per-bucket min/max/first/last, computed on the fly.
@@ -94,7 +113,19 @@ pub struct SeriesData {
     pub channels: BTreeMap<String, ChannelData>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+impl ToJson for SeriesData {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field("mode", self.mode)?
+            .field("rows", &self.rows)?
+            .field("bucket_us", &self.bucket_us)?
+            .field("t", &self.t)?
+            .field("channels", &self.channels)?
+            .end()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DataResponse {
     pub from: i64,
     pub to: i64,
@@ -107,6 +138,20 @@ pub struct DataResponse {
     /// True when the point budget reduced `buckets` or `max_raw`.
     pub capped: bool,
     pub series: BTreeMap<String, SeriesData>,
+}
+
+impl ToJson for DataResponse {
+    fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        Object::new(w)?
+            .field("from", &self.from)?
+            .field("to", &self.to)?
+            .field("buckets", &self.buckets)?
+            .field("max_raw", &self.max_raw)?
+            .field("points", &self.points)?
+            .field("capped", &self.capped)?
+            .field("series", &self.series)?
+            .end()
+    }
 }
 
 pub struct DataRequest<'a> {

@@ -54,7 +54,9 @@ opening someone else's is worse than saying nothing was named.
 separated by gaps up to a week long. The axis maps wall-clock time onto units
 where every covered span keeps its true duration and every gap is squeezed to a
 fixed sliver, labelled with what it swallowed (`⋯ 6.4d`). The strip at the top
-shows per-series coverage.
+shows coverage for each series a selected channel belongs to — only the time
+axis when nothing is selected. With several series, its `▾ N series` toggle
+folds it to a single lane, with a picker for which series that lane shows.
 
 | Gesture             | Coverage strip           | Charts                              |
 |:--------------------|:-------------------------|:------------------------------------|
@@ -220,7 +222,9 @@ needs is the step-function hold described above.
 
 | File              | Role                                                  |
 |:------------------|:------------------------------------------------------|
-| `src/main.rs`     | CLI, limits, axum routes, error mapping               |
+| `src/main.rs`     | CLI, limits, routes, error mapping                    |
+| `src/http.rs`     | HTTP/1.1 server and static files, standard library only |
+| `src/json.rs`     | JSON writer the responses stream through              |
 | `src/db.rs`       | Connection pool, view creation, catalog discovery     |
 | `src/query.rs`    | Coverage and windowed reads, point budget             |
 | `web/timeaxis.js` | The gap-collapsing axis, tick and duration formatting |
