@@ -1,0 +1,18 @@
+# The context is sent to the daemon whole, so keep it to what the build copies.
+# `target/` alone was 369 MiB when this was written.
+target/
+
+# Machine-specific: it pins DUCKDB_LIB_DIR to a Homebrew prefix, and that env
+# var outranks DUCKDB_DOWNLOAD_LIB in the build script. Copied in, it would
+# point the link step at a directory that does not exist in the image.
+.cargo/
+
+.git/
+.gitignore
+.vscode/
+
+docs/
+README.md
+
+Dockerfile
+.dockerignore
