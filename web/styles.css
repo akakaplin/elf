@@ -476,15 +476,22 @@ body {
   pointer-events: none;
 }
 
+/* Stacked down the left edge of the plot rather than strung across the top:
+   a column keeps every label on one line, so a long channel name no longer
+   pushes its neighbours onto a second row. It wraps into further columns
+   when the chart is too short to hold the whole list. */
 .legend {
   position: absolute;
   top: 4px;
+  bottom: 8px;
   left: 72px;
   right: 12px;
   display: flex;
+  flex-direction: column;
   flex-wrap: wrap;
-  gap: 4px 12px;
-  align-items: baseline;
+  gap: 2px 10px;
+  align-items: flex-start;
+  align-content: flex-start;
   pointer-events: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10.5px;
@@ -622,7 +629,8 @@ body {
   cursor: pointer;
 }
 
-.mini:hover { color: var(--text); border-color: var(--line); background: var(--panel); }
+.mini:hover:not(:disabled) { color: var(--text); border-color: var(--line); background: var(--panel); }
+.mini:disabled { opacity: 0.35; cursor: default; }
 
 /* ---- editor ---- */
 

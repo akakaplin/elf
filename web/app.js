@@ -370,6 +370,18 @@ function App() {
     setSynths((cur) => cur.map((d, k) => (k === i ? def : d)));
   }, []);
 
+  /// The copy lands directly under its original rather than at the end, so a
+  /// formula and its variants stay next to each other in the list. Its inputs
+  /// are the same channels, so the request budget cannot be exceeded by this.
+  const duplicateSynth = useCallback((i) => {
+    setSynths((cur) => {
+      const src = cur[i];
+      if (!src || cur.length >= MAX_SYNTH) return cur;
+      const copy = { ...src, name: copyName(src.name, cur.map((d) => d.name)), refs: [...src.refs] };
+      return [...cur.slice(0, i + 1), copy, ...cur.slice(i + 1)];
+    });
+  }, []);
+
   const removeSynth = useCallback((i) => {
     setSynths((cur) => {
       const gone = cur[i];
@@ -419,6 +431,7 @@ function App() {
         roomFor=${roomFor}
         onAddSynth=${addSynth}
         onUpdateSynth=${updateSynth}
+        onDuplicateSynth=${duplicateSynth}
         onRemoveSynth=${removeSynth}
         fetchCount=${fetchChannels.length}
         selected=${selected}
@@ -578,6 +591,19 @@ function rank(id, head) {
   return 2;
 }
 
+/// A name for a copy of `base`, avoiding everything in `taken`.
+///
+/// A formula is identified by its name, so a duplicate cannot keep the one it
+/// was copied from. Duplicating a copy extends the counter rather than the
+/// suffix: "spread copy" becomes "spread copy 2", never "spread copy copy".
+function copyName(base, taken) {
+  const stem = `${base.replace(/ copy(?: \d+)?$/, '')} copy`;
+  if (!taken.includes(stem)) return stem;
+  for (let n = 2; ; n++) {
+    if (!taken.includes(`${stem} ${n}`)) return `${stem} ${n}`;
+  }
+}
+
 /// Editor for one synthetic channel.
 ///
 /// The inputs are bound to short names rather than referenced by channel id:
@@ -676,7 +702,7 @@ function Sidebar(props) {
   const {
     catalog, online, collapsed, onCollapse, onExpand, selected, hidden, onToggle, onClear, colorOf,
     chartCount, settings, compiled, roomFor, onAddSynth, onUpdateSynth,
-    onRemoveSynth, fetchCount,
+    onDuplicateSynth, onRemoveSynth, fetchCount,
   } = props;
   const [filter, setFilter] = useState('');
   const [open, setOpen] = useState(false);
@@ -685,6 +711,7 @@ function Sidebar(props) {
   // A formula's inputs occupy request slots too, so the budget shown is the
   // one the server actually enforces.
   const full = fetchCount >= MAX_CHANNELS;
+  const synthsFull = compiled.length >= MAX_SYNTH;
 
   // Collapsed, the panel keeps a rail of its own rather than vanishing and
   // floating a button over the chart -- which lands on the timeline's labels.
@@ -826,6 +853,13 @@ function Sidebar(props) {
                       html`<span class="bind" key=${v}><em>${v}</em>${d.refs[k]}</span>`)}</span>`}
               </span>
               <button class="mini" title="Edit" aria-label=${`Edit ${d.name}`} onClick=${() => setEditing(i)}>✎</button>
+              <button
+                class="mini"
+                title=${synthsFull ? `Already at ${MAX_SYNTH} formulas` : 'Duplicate'}
+                aria-label=${`Duplicate ${d.name}`}
+                disabled=${synthsFull}
+                onClick=${() => { onDuplicateSynth(i); setEditing(i + 1); }}
+              >⧉</button>
               <button class="mini" title="Delete" aria-label=${`Delete ${d.name}`} onClick=${() => onRemoveSynth(i)}>✕</button>
             </div>`
         ))}
@@ -843,7 +877,7 @@ function Sidebar(props) {
           : html`
             <button
               class="ghost"
-              disabled=${compiled.length >= MAX_SYNTH}
+              disabled=${synthsFull}
               onClick=${() => setEditing(-1)}
             >+ new formula</button>`}
       </div>
