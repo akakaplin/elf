@@ -1,11 +1,14 @@
 //! Read-side queries. Every one of these runs against the raw parquet views;
-//! nothing is materialised, cached on disk, or precomputed.
+//! nothing is materialised or cached on disk. Coverage is the one answer kept
+//! in memory between requests -- see `coverage.rs` -- and this defines its
+//! shape.
 
-use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
 use crate::db::{quote_ident, Db};
+use crate::duck::Connection;
+use crate::error::{err, Result};
 use crate::json::{Object, ToJson};
 
 // ---------------------------------------------------------------- coverage --
@@ -13,7 +16,8 @@ use crate::json::{Object, ToJson};
 #[derive(Debug, Clone)]
 pub struct Coverage {
     pub bucket_us: i64,
-    /// Per series: the half-open [start, end) windows that actually hold rows.
+    /// Per series: the half-open [start, end) windows that actually hold rows,
+    /// joined across gaps up to the request's `merge_ms`.
     pub series: BTreeMap<String, Vec<[i64; 2]>>,
     /// Union across series -- what the timeline collapses gaps against.
     pub union: Vec<[i64; 2]>,
@@ -27,51 +31,6 @@ impl ToJson for Coverage {
             .field("union", &self.union)?
             .end()
     }
-}
-
-/// Finds the occupied stretches of wall-clock time by bucketing `ts` and
-/// merging adjacent buckets. Only the `ts` column is read, so this stays fast
-/// even across the whole store.
-pub fn coverage(db: &Db, bucket_us: i64) -> Result<Coverage> {
-    let bucket_us = bucket_us.max(1);
-    let conn = db.lease()?;
-    let mut per_series = BTreeMap::new();
-    let mut all: Vec<i64> = Vec::new();
-
-    for info in &db.catalog.series {
-        let sql = format!(
-            "SELECT DISTINCT epoch_us(ts) // {bucket_us} AS b FROM {} ORDER BY b",
-            quote_ident(&info.name)
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let buckets: Vec<i64> = stmt
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        all.extend_from_slice(&buckets);
-        per_series.insert(info.name.clone(), merge(&buckets, bucket_us));
-    }
-
-    all.sort_unstable();
-    all.dedup();
-
-    Ok(Coverage {
-        bucket_us,
-        series: per_series,
-        union: merge(&all, bucket_us),
-    })
-}
-
-/// Turns a sorted bucket-index list into half-open time spans, joining buckets
-/// that sit next to each other.
-fn merge(buckets: &[i64], bucket_us: i64) -> Vec<[i64; 2]> {
-    let mut spans: Vec<[i64; 2]> = Vec::new();
-    for &b in buckets {
-        match spans.last_mut() {
-            Some(last) if b * bucket_us <= last[1] => last[1] = (b + 1) * bucket_us,
-            _ => spans.push([b * bucket_us, (b + 1) * bucket_us]),
-        }
-    }
-    spans
 }
 
 // -------------------------------------------------------------------- data --
@@ -110,6 +69,11 @@ pub struct SeriesData {
     pub bucket_us: i64,
     /// Point time in epoch micros (exact `ts` in raw mode, bucket start in agg).
     pub t: Vec<i64>,
+    /// Present in `agg` mode: the latest `ts` in each bucket, which is when its
+    /// `last` value was actually recorded. Anything that treats `last` as a
+    /// reading must place it here, not at the bucket start, or it reads a value
+    /// up to a bucket before it existed.
+    pub t_last: Option<Vec<i64>>,
     pub channels: BTreeMap<String, ChannelData>,
 }
 
@@ -120,6 +84,7 @@ impl ToJson for SeriesData {
             .field("rows", &self.rows)?
             .field("bucket_us", &self.bucket_us)?
             .field("t", &self.t)?
+            .field_if_some("t_last", &self.t_last)?
             .field("channels", &self.channels)?
             .end()
     }
@@ -170,7 +135,7 @@ pub struct DataRequest<'a> {
 
 pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
     if req.to <= req.from {
-        return Err(anyhow!("empty window: from must be < to"));
+        return Err(err!("empty window: from must be < to"));
     }
 
     // Group the requested channels by series so each series costs one scan.
@@ -178,12 +143,12 @@ pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
     for id in req.channels {
         let (series, field) = id
             .split_once(':')
-            .ok_or_else(|| anyhow!("bad channel id `{id}`, expected `<series>:<field>`"))?;
+            .ok_or_else(|| err!("bad channel id `{id}`, expected `<series>:<field>`"))?;
         let info = db
             .series(series)
-            .ok_or_else(|| anyhow!("unknown series `{series}`"))?;
+            .ok_or_else(|| err!("unknown series `{series}`"))?;
         if !info.channels.iter().any(|c| c.field == field) {
-            return Err(anyhow!("unknown channel `{id}`"));
+            return Err(err!("unknown channel `{id}`"));
         }
         let fields = wanted.entry(series.to_string()).or_default();
         if !fields.iter().any(|f| f == field) {
@@ -191,17 +156,9 @@ pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
         }
     }
 
-    // What one point of each shape costs, so the budget can be spent honestly:
-    // an agg bucket carries min/max/first/last per channel plus one timestamp
-    // per series, a raw row carries one value per channel plus its timestamp.
-    let n_channels: i64 = wanted.values().map(|f| f.len() as i64).sum();
-    let n_series = wanted.len() as i64;
-    let agg_cost = (4 * n_channels + n_series).max(1);
-    let raw_cost = (n_channels + n_series).max(1);
-
+    let fields_per_series: Vec<i64> = wanted.values().map(|f| f.len() as i64).collect();
     let asked_buckets = req.buckets.clamp(1, 20_000);
-    let buckets = asked_buckets.min((req.max_points / agg_cost).max(1));
-    let max_raw = req.max_raw.min((req.max_points / raw_cost).max(1));
+    let (buckets, max_raw) = budget(req.max_points, &fields_per_series, asked_buckets, req.max_raw);
     let capped = buckets < asked_buckets || max_raw < req.max_raw;
     let bucket_us = (((req.to - req.from) as f64) / buckets as f64).ceil().max(1.0) as i64;
 
@@ -214,11 +171,9 @@ pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
             req.from, req.to
         );
 
-        let rows: i64 = conn.query_row(
-            &format!("SELECT count(*) FROM {ident} WHERE {window}"),
-            [],
-            |row| row.get(0),
-        )?;
+        let rows = conn
+            .query_i64(&format!("SELECT count(*) FROM {ident} WHERE {window}"))?
+            .unwrap_or(0);
 
         let sd = if rows <= max_raw {
             fetch_raw(&conn, &ident, &window, fields)?
@@ -248,7 +203,7 @@ pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
                         .sum::<i64>()
                 })
                 .sum();
-            per_channel + sd.t.len() as i64
+            per_channel + sd.t.len() as i64 + sd.t_last.as_ref().map_or(0, |t| t.len() as i64)
         })
         .sum();
 
@@ -263,8 +218,31 @@ pub fn data(db: &Db, req: &DataRequest) -> Result<DataResponse> {
     })
 }
 
+/// Splits `max_points` across the series of one request, returning the bucket
+/// count and the raw threshold that keep the whole response within it.
+///
+/// Each series is costed as if aggregated -- `4f + 2` values per bucket for `f`
+/// channels: min/max/first/last each, plus its two timestamps -- and gets that
+/// share of the budget. The bucket count is the same for every series, so their
+/// buckets line up. The raw threshold is the largest row count that fits every
+/// series' share at `f + 1` values per row. Whichever mode each series then
+/// lands in, it stays inside its share, so a response mixing raw and agg series
+/// cannot overshoot the way two separately-capped halves would.
+fn budget(max_points: i64, fields_per_series: &[i64], buckets: i64, max_raw: i64) -> (i64, i64) {
+    let total: i64 = fields_per_series.iter().map(|f| 4 * f + 2).sum::<i64>().max(1);
+    let raw_fit = fields_per_series
+        .iter()
+        .map(|f| max_points * (4 * f + 2) / total / (f + 1))
+        .min()
+        .unwrap_or(max_points);
+    (
+        buckets.min((max_points / total).max(1)),
+        max_raw.min(raw_fit.max(1)),
+    )
+}
+
 fn fetch_raw(
-    conn: &duckdb::Connection,
+    conn: &Connection,
     ident: &str,
     window: &str,
     fields: &[String],
@@ -279,16 +257,20 @@ fn fetch_raw(
         cols.join(", ")
     );
 
-    let mut stmt = conn.prepare(&sql)?;
     let mut t = Vec::new();
     let mut vals: Vec<Vec<Option<f64>>> = vec![Vec::new(); fields.len()];
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        t.push(row.get::<_, i64>(0)?);
+    conn.query(&sql)?.for_each_chunk(|chunk| {
+        let ts = chunk.i64s(0)?;
+        // `ts` is never null in a series orc wrote; a row without one could not
+        // be placed on the axis, so it is left out with its values.
+        let keep: Vec<usize> = (0..chunk.len()).filter(|&r| ts.get(r).is_some()).collect();
+        t.extend(keep.iter().filter_map(|&r| ts.get(r)));
         for (i, col) in vals.iter_mut().enumerate() {
-            col.push(row.get::<_, Option<f64>>(i + 1)?);
+            let v = chunk.f64s(i + 1)?;
+            col.extend(keep.iter().map(|&r| v.get(r)));
         }
-    }
+        Ok(())
+    })?;
 
     let channels = fields
         .iter()
@@ -306,12 +288,13 @@ fn fetch_raw(
         rows: t.len() as i64,
         bucket_us: 0,
         t,
+        t_last: None,
         channels,
     })
 }
 
 fn fetch_agg(
-    conn: &duckdb::Connection,
+    conn: &Connection,
     ident: &str,
     window: &str,
     fields: &[String],
@@ -328,31 +311,47 @@ fn fetch_agg(
         cols.push(format!("arg_max({v}, ts)"));
     }
     let sql = format!(
-        "SELECT (epoch_us(ts) - {from}) // {bucket_us} AS b, {} \
+        "SELECT (epoch_us(ts) - {from}) // {bucket_us} AS b, epoch_us(max(ts)), {} \
          FROM {ident} WHERE {window} GROUP BY b ORDER BY b",
         cols.join(", ")
     );
 
-    let mut stmt = conn.prepare(&sql)?;
     let mut t = Vec::new();
+    let mut t_last = Vec::new();
     let n = fields.len();
     let mut lo: Vec<Vec<Option<f64>>> = vec![Vec::new(); n];
     let mut hi: Vec<Vec<Option<f64>>> = vec![Vec::new(); n];
     let mut first: Vec<Vec<Option<f64>>> = vec![Vec::new(); n];
     let mut last: Vec<Vec<Option<f64>>> = vec![Vec::new(); n];
 
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let b = row.get::<_, i64>(0)?;
-        t.push(from + b * bucket_us);
-        for i in 0..n {
-            let base = 1 + i * 4;
-            lo[i].push(row.get::<_, Option<f64>>(base)?);
-            hi[i].push(row.get::<_, Option<f64>>(base + 1)?);
-            first[i].push(row.get::<_, Option<f64>>(base + 2)?);
-            last[i].push(row.get::<_, Option<f64>>(base + 3)?);
+    conn.query(&sql)?.for_each_chunk(|chunk| {
+        let b = chunk.i64s(0)?;
+        let tl = chunk.i64s(1)?;
+        // A bucket exists only because it holds a row, so both are set.
+        let keep: Vec<usize> = (0..chunk.len())
+            .filter(|&r| b.get(r).is_some() && tl.get(r).is_some())
+            .collect();
+        for &r in &keep {
+            t.push(from + b.get(r).unwrap_or(0) * bucket_us);
+            t_last.push(tl.get(r).unwrap_or(0));
         }
-    }
+        for i in 0..n {
+            let base = 2 + i * 4;
+            let (l, h, f, z) = (
+                chunk.f64s(base)?,
+                chunk.f64s(base + 1)?,
+                chunk.f64s(base + 2)?,
+                chunk.f64s(base + 3)?,
+            );
+            for &r in &keep {
+                lo[i].push(l.get(r));
+                hi[i].push(h.get(r));
+                first[i].push(f.get(r));
+                last[i].push(z.get(r));
+            }
+        }
+        Ok(())
+    })?;
 
     let mut channels = BTreeMap::new();
     for (i, f) in fields.iter().enumerate() {
@@ -373,6 +372,41 @@ fn fetch_agg(
         rows: 0,
         bucket_us,
         t,
+        t_last: Some(t_last),
         channels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a response costs at the worst, given each series' mode.
+    fn worst(fields: &[i64], buckets: i64, max_raw: i64, raw: &[bool]) -> i64 {
+        fields
+            .iter()
+            .zip(raw)
+            .map(|(f, &r)| if r { max_raw * (f + 1) } else { buckets * (4 * f + 2) })
+            .sum()
+    }
+
+    #[test]
+    fn budget_holds_whatever_mix_of_modes_results() {
+        for fields in [&[1][..], &[2], &[1, 1], &[5, 1], &[1, 3, 2], &[20], &[1; 20]] {
+            for max_points in [1_000, 250_000, 1_000_000, 4_000_000] {
+                let (buckets, max_raw) = budget(max_points, fields, 20_000, 1 << 40);
+                for mask in 0..1u32 << fields.len() {
+                    let raw: Vec<bool> = (0..fields.len()).map(|i| mask >> i & 1 == 1).collect();
+                    let cost = worst(fields, buckets, max_raw, &raw);
+                    assert!(cost <= max_points, "{fields:?} {max_points} {raw:?}: {cost}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn budget_leaves_small_asks_alone() {
+        assert_eq!(budget(1_000_000, &[2], 1200, 12_000), (1200, 12_000));
+        assert_eq!(budget(1_000_000, &[1, 1, 1], 1200, 12_000), (1200, 12_000));
+    }
 }

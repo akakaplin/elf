@@ -7,7 +7,7 @@
 import { checkHealth, getCatalog, getCoverage, loadWindow } from './api.js';
 import { buildAxis, fmtDelta, fmtDuration, fmtTime } from './timeaxis.js';
 import {
-  drawChart, drawTimeline, PALETTE, PAD, sampleAt,
+  drawChart, drawTimeline, markerFor, PALETTE, PAD, sampleAt,
   TIMELINE_AXIS, TIMELINE_LANE, TIMELINE_LEFT, TIMELINE_TOP,
 } from './chart.js';
 import { channelExtent, describeRange, fmtValue, groupChannels, unionExtent } from './scales.js';
@@ -16,7 +16,7 @@ import { compile, evalSegment, varNames } from './formula.js';
 const html = htm.bind(React.createElement);
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
-const MAX_CHANNELS = 10;
+const MAX_CHANNELS = 20;
 /// Synthetic channels live in their own id namespace so nothing downstream has
 /// to special-case them: `syn:spread` groups, colours and hovers like any other.
 const SYN = 'syn:';
@@ -205,7 +205,10 @@ function App() {
     (async () => {
       try {
         const cat = await getCatalog();
-        const cov = await getCoverage(15000);
+        // Lanes join gaps under a minute: across the whole store that is less
+        // than a pixel, and it is what keeps a thin trade feed from being
+        // thousands of spans.
+        const cov = await getCoverage(15000, 60000);
         if (!alive) return;
         setCatalog(cat);
         setCoverage(cov);
@@ -275,6 +278,7 @@ function App() {
           totalBuckets: Math.min(3000, Math.max(200, Math.round(plotW))),
           maxRaw: rawBudget,
           maxPoints,
+          minPoints: catalog && catalog.limits ? catalog.limits.min_points : undefined,
           signal: controller.signal,
         });
         if (reqRef.current !== id) return;
@@ -288,7 +292,7 @@ function App() {
       }
     }, 90);
     return () => { clearTimeout(timerRef.current); controller.abort(); };
-  }, [axis, view, fetchChannels, plotW, rawBudget, maxPoints]);
+  }, [axis, view, fetchChannels, plotW, rawBudget, maxPoints, catalog]);
 
   /// Formulas are evaluated here rather than in SQL: their inputs live in
   /// different parquet files with unrelated sample times, and the join that
@@ -712,6 +716,16 @@ function Sidebar(props) {
   // one the server actually enforces.
   const full = fetchCount >= MAX_CHANNELS;
   const synthsFull = compiled.length >= MAX_SYNTH;
+  /// Explicit open/closed choices per group; anything absent falls back to a
+  /// default -- a currency opens while it holds a selection or a filter is
+  /// typed, a series always starts open.
+  const [groupState, setGroupState] = useState(loadGroupState);
+  const isOpen = (key, dflt) => (filter ? true : groupState[key] ?? dflt);
+  const toggleGroup = (key, cur) => setGroupState((g) => {
+    const next = { ...g, [key]: !cur };
+    saveGroupState(next);
+    return next;
+  });
 
   // Collapsed, the panel keeps a rail of its own rather than vanishing and
   // floating a button over the chart -- which lands on the timeline's labels.
@@ -779,43 +793,70 @@ function Sidebar(props) {
           onInput=${(e) => setFilter(e.target.value)}
         />
         <div class="channels">
-          ${catalog.series.map((s) => {
-            const visible = s.channels.filter(
-              (c) => !filter || `${s.name}:${c.field}`.toLowerCase().includes(filter.toLowerCase())
-            );
-            if (!visible.length) return null;
+          ${groupByCcy(catalog.series).map(([ccy, series]) => {
+            const lists = series
+              .map((s) => [s, s.channels.filter(
+                (c) => !filter || `${s.name}:${c.field}`.toLowerCase().includes(filter.toLowerCase())
+              )])
+              .filter(([, v]) => v.length);
+            if (!lists.length) return null;
+            const picked = lists.reduce((n, [, v]) => n + v.filter((c) => selected.includes(c.id)).length, 0);
+            const ccyOpen = isOpen(`ccy:${ccy}`, !!filter || picked > 0);
             return html`
-              <div class="series" key=${s.name}>
-                <div class="series-head">
-                  ${s.name}
-                  <span class="rows">${s.rows.toLocaleString()}</span>
-                </div>
-                ${visible.map((c) => {
-                  const on = selected.includes(c.id);
-                  const off = on && hidden.includes(c.id);
-                  const blocked = !on && full;
+              <div class="ccy" key=${ccy}>
+                <button
+                  type="button"
+                  class="ccy-head"
+                  aria-expanded=${ccyOpen}
+                  onClick=${() => toggleGroup(`ccy:${ccy}`, ccyOpen)}
+                >
+                  <span class="caret">${ccyOpen ? '▾' : '▸'}</span>
+                  <span class="label">${ccy}</span>
+                  ${picked > 0 && html`<span class="picked">${picked}</span>`}
+                  <span class="rows">${lists.length}</span>
+                </button>
+                ${ccyOpen && lists.map(([s, visible]) => {
+                  const sOpen = isOpen(`series:${s.name}`, true);
                   return html`
+                  <div class="series" key=${s.name}>
                     <button
-                      key=${c.id}
                       type="button"
-                      class=${'chan' + (on ? ' on' : '') + (off ? ' off' : '')
-                        + (DEMOTED.test(c.field) ? ' demoted' : '')}
-                      style=${{ borderLeftColor: on ? colorOf(c.id) : 'transparent' }}
-                      aria-pressed=${on}
-                      disabled=${blocked}
-                      title=${blocked ? `Deselect one first — ${MAX_CHANNELS} is the limit` : c.id}
-                      onClick=${() => onToggle(c.id)}
+                      class="series-head"
+                      aria-expanded=${sOpen}
+                      onClick=${() => toggleGroup(`series:${s.name}`, sOpen)}
                     >
-                      <span
-                        class="swatch"
-                        style=${on
-                          ? { background: off ? 'transparent' : colorOf(c.id), borderColor: colorOf(c.id) }
-                          : null}
-                      ></span>
-                      <span class="name">${c.field}</span>
-                      <span class="dtype">${c.dtype.toLowerCase()}</span>
+                      <span><span class="caret">${sOpen ? '▾' : '▸'}</span>${s.name}</span>
+                      <span class="rows">${s.rows.toLocaleString()}</span>
                     </button>
-                  `;
+                    ${sOpen && visible.map((c) => {
+                      const on = selected.includes(c.id);
+                      const off = on && hidden.includes(c.id);
+                      const blocked = !on && full;
+                      return html`
+                        <button
+                          key=${c.id}
+                          type="button"
+                          class=${'chan' + (on ? ' on' : '') + (off ? ' off' : '')
+                            + (DEMOTED.test(c.field) ? ' demoted' : '')}
+                          style=${{ borderLeftColor: on ? colorOf(c.id) : 'transparent' }}
+                          aria-pressed=${on}
+                          disabled=${blocked}
+                          title=${blocked ? `Deselect one first — ${MAX_CHANNELS} is the limit` : c.id}
+                          onClick=${() => onToggle(c.id)}
+                        >
+                          <span
+                            class="swatch"
+                            style=${on
+                              ? { background: off ? 'transparent' : colorOf(c.id), borderColor: colorOf(c.id) }
+                              : null}
+                          ></span>
+                          <span class="name">${c.field}</span>
+                          <span class="dtype">${c.dtype.toLowerCase()}</span>
+                        </button>
+                      `;
+                    })}
+                  </div>
+                `;
                 })}
               </div>
             `;
@@ -883,6 +924,37 @@ function Sidebar(props) {
       </div>
     </aside>
   `;
+}
+
+/// Series grouped by currency -- the last `_` segment of the name
+/// (`aster_bbo_ETH` -> `ETH`) -- currencies sorted, series kept in catalog order.
+function groupByCcy(series) {
+  const groups = new Map();
+  for (const s of series) {
+    const i = s.name.lastIndexOf('_');
+    const ccy = i >= 0 && i < s.name.length - 1 ? s.name.slice(i + 1) : s.name;
+    if (!groups.has(ccy)) groups.set(ccy, []);
+    groups.get(ccy).push(s);
+  }
+  return [...groups].sort(([a], [b]) => a.localeCompare(b));
+}
+
+const GROUP_KEY = 'elf.groups';
+
+function loadGroupState() {
+  try {
+    return JSON.parse(localStorage.getItem(GROUP_KEY)) || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveGroupState(g) {
+  try {
+    localStorage.setItem(GROUP_KEY, JSON.stringify(g));
+  } catch {
+    // Storage blocked -- groups just reset on reload.
+  }
 }
 
 // --------------------------------------------------------------- settings ---
@@ -1345,7 +1417,9 @@ function Chart(props) {
               title=${off ? 'Show this line' : 'Hide this line — its data stays loaded'}
               onClick=${() => onToggleVisible(id)}
             >
-              <i style=${{ background: colorOf(id) }}></i>
+              ${lineStyle === 'dot'
+                ? html`<${MarkGlyph} shape=${markerFor(id)} color=${colorOf(id)} />`
+                : html`<i style=${{ background: colorOf(id) }}></i>`}
               ${labelFor(id)}
               <b>${s ? fmtValue(s.value) : ''}</b>
               ${s && s.mode === 'agg' && s.lo != null && s.hi !== s.lo
@@ -1356,6 +1430,26 @@ function Chart(props) {
         })}
       </div>
     </div>
+  `;
+}
+
+/// SVG paths for the dot-mode marks, on a 10x10 box -- the same shapes
+/// `addMark` draws on the canvas, at legend size.
+const MARK_PATHS = {
+  up: 'M5 1.4 L9 8.2 L1 8.2 Z',
+  down: 'M5 8.6 L9 1.8 L1 1.8 Z',
+  square: 'M2 2 H8 V8 H2 Z',
+  diamond: 'M5 0.8 L9.2 5 L5 9.2 L0.8 5 Z',
+  plus: 'M1 3.8 H9 V6.2 H1 Z M3.8 1 H6.2 V9 H3.8 Z',
+};
+
+function MarkGlyph({ shape, color }) {
+  return html`
+    <svg class="mark" viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">
+      ${MARK_PATHS[shape]
+        ? html`<path d=${MARK_PATHS[shape]} fill=${color} />`
+        : html`<circle cx="5" cy="5" r="3.2" fill=${color} />`}
+    </svg>
   `;
 }
 

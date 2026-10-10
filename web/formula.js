@@ -166,8 +166,11 @@ export function evalSegment(seg, refs, fn) {
   if (cols.some((c) => !c || !c.t || !c.t.length)) return null;
 
   // An aggregated bucket stands for its closing value here, matching what the
-  // chart draws as the line through an envelope.
+  // chart draws as the line through an envelope -- and it enters at the time
+  // that value was recorded, not at the bucket start. Placed at the start, a
+  // bucketed input would hand a raw one a reading from up to a bucket ahead.
   const pick = cols.map((c) => (c.mode === 'agg' ? c.last : c.v) || []);
+  const times = cols.map((c) => (c.mode === 'agg' && c.tLast) || c.t);
   const n = cols.length;
   const idx = new Int32Array(n);
   const held = new Array(n).fill(null);
@@ -179,13 +182,13 @@ export function evalSegment(seg, refs, fn) {
   for (;;) {
     let tMin = Infinity;
     for (let k = 0; k < n; k++) {
-      const t = cols[k].t;
+      const t = times[k];
       if (idx[k] < t.length && t[idx[k]] < tMin) tMin = t[idx[k]];
     }
     if (tMin === Infinity) break;
 
     for (let k = 0; k < n; k++) {
-      const t = cols[k].t;
+      const t = times[k];
       while (idx[k] < t.length && t[idx[k]] === tMin) {
         const v = pick[k][idx[k]];
         if (v != null && Number.isFinite(v)) {

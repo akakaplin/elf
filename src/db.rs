@@ -5,14 +5,15 @@
 //! `series/<name>/**/*.parquet`, exactly like the `view.sql` orc writes next to
 //! the data, and every query in `query.rs` hits those views directly.
 
-use anyhow::{anyhow, Context, Result};
-use duckdb::Connection;
 use std::{
     io::{self, Write},
     path::Path,
     sync::Mutex,
 };
 
+use crate::coverage::Cache;
+use crate::duck::{Connection, Database};
+use crate::error::{err, Result};
 use crate::json::{Object, ToJson};
 
 const MAX_IDLE: usize = 8;
@@ -78,9 +79,12 @@ impl Catalog {
 }
 
 pub struct Db {
-    root: Mutex<Connection>,
+    // Declared before `database` so the pooled connections close first.
     idle: Mutex<Vec<Connection>>,
+    database: Database,
     pub catalog: Catalog,
+    /// Each file's coverage, read once; see `coverage.rs`.
+    pub coverage: Cache,
 }
 
 /// A checked-out connection that returns itself to the pool on drop.
@@ -113,14 +117,15 @@ impl Db {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let data_dir = data_dir
             .canonicalize()
-            .with_context(|| format!("data dir not found: {}", data_dir.display()))?;
+            .map_err(|e| err!("data dir not found: {}: {e}", data_dir.display()))?;
         let series_dir = data_dir.join("series");
         if !series_dir.is_dir() {
-            return Err(anyhow!("no series/ directory under {}", data_dir.display()));
+            return Err(err!("no series/ directory under {}", data_dir.display()));
         }
 
-        let conn = Connection::open_in_memory().context("open duckdb")?;
-        conn.execute_batch("SET TimeZone='UTC';")?;
+        let database = Database::open_in_memory()?;
+        let conn = database.connect()?;
+        conn.execute("SET TimeZone='UTC';")?;
 
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&series_dir)? {
@@ -144,7 +149,7 @@ impl Db {
                 quote_ident(&name),
                 escape_literal(&glob.to_string_lossy()),
             );
-            if let Err(e) = conn.execute_batch(&sql) {
+            if let Err(e) = conn.execute(&sql) {
                 eprintln!("skipping series {name}: {e}");
                 continue;
             }
@@ -155,15 +160,17 @@ impl Db {
         }
 
         if series.is_empty() {
-            return Err(anyhow!("no readable series under {}", series_dir.display()));
+            return Err(err!("no readable series under {}", series_dir.display()));
         }
 
         let t_min = series.iter().filter_map(|s| s.t_min).min();
         let t_max = series.iter().filter_map(|s| s.t_max).max();
 
         Ok(Db {
-            root: Mutex::new(conn),
-            idle: Mutex::new(Vec::new()),
+            // The connection that built the views is the pool's first.
+            idle: Mutex::new(vec![conn]),
+            database,
+            coverage: Cache::new(&data_dir),
             catalog: Catalog {
                 data_dir: data_dir.to_string_lossy().into_owned(),
                 series,
@@ -180,10 +187,10 @@ impl Db {
                 db: self,
             });
         }
-        // Clones share the same in-memory database, so the views and DuckDB's
-        // parquet metadata cache are shared across the pool.
-        let conn = self.root.lock().unwrap().try_clone()?;
-        conn.execute_batch("SET TimeZone='UTC';")?;
+        // Every connection shares the one in-memory database, so the views and
+        // DuckDB's parquet metadata cache are shared across the pool.
+        let conn = self.database.connect()?;
+        conn.execute("SET TimeZone='UTC';")?;
         Ok(Lease {
             conn: Some(conn),
             db: self,
@@ -198,10 +205,16 @@ impl Db {
 fn describe(conn: &Connection, name: &str) -> Result<SeriesInfo> {
     let ident = quote_ident(name);
 
-    let mut stmt = conn.prepare(&format!("DESCRIBE {ident}"))?;
-    let cols: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
+    let mut cols: Vec<(String, String)> = Vec::new();
+    conn.query(&format!("DESCRIBE {ident}"))?
+        .for_each_chunk(|chunk| {
+            for r in 0..chunk.len() {
+                if let (Some(name), Some(ty)) = (chunk.string(0, r)?, chunk.string(1, r)?) {
+                    cols.push((name, ty));
+                }
+            }
+            Ok(())
+        })?;
 
     let channels = cols
         .iter()
@@ -214,16 +227,15 @@ fn describe(conn: &Connection, name: &str) -> Result<SeriesInfo> {
         })
         .collect();
 
-    let mut stmt = conn.prepare(&format!(
+    let mut result = conn.query(&format!(
         "SELECT count(*), epoch_us(min(ts)), epoch_us(max(ts)) FROM {ident}"
     ))?;
-    let (rows, t_min, t_max) = stmt.query_row([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-        ))
-    })?;
+    let chunk = result.next_chunk().ok_or_else(|| err!("no row from {ident}"))?;
+    let (rows, t_min, t_max) = (
+        chunk.i64s(0)?.get(0).unwrap_or(0),
+        chunk.i64s(1)?.get(0),
+        chunk.i64s(2)?.get(0),
+    );
 
     Ok(SeriesInfo {
         name: name.to_string(),

@@ -255,18 +255,57 @@ body {
 
 .channels { max-height: 42vh; overflow-y: auto; margin: -2px -4px 8px; padding: 0 4px; }
 
-.series + .series { margin-top: 9px; }
+.ccy + .ccy { margin-top: 6px; }
+
+.ccy-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 2px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ccy-head .label { flex: 1; }
+.ccy-head .rows { color: var(--dim); font-weight: 400; font-size: 10.5px; }
+.ccy-head .picked {
+  font-size: 10px;
+  font-weight: 400;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--line-soft);
+  color: var(--muted);
+}
+
+.caret { display: inline-block; width: 10px; color: var(--dim); font-size: 9px; }
+
+.ccy > .series { margin: 4px 0 0 10px; }
 
 .series-head {
   display: flex;
   justify-content: space-between;
+  width: 100%;
   font-family: ui-monospace, Menlo, monospace;
   font-size: 10.5px;
   color: var(--muted);
   padding: 3px 2px;
+  border: 0;
   border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
   margin-bottom: 3px;
 }
+
+.ccy-head:hover, .series-head:hover { color: var(--text); background: var(--panel-2); }
 
 .series-head .rows { color: var(--dim); }
 
@@ -528,6 +567,7 @@ body {
 .legend .item.off .lbl { text-decoration: line-through; }
 
 .legend i { width: 8px; height: 2px; border-radius: 1px; display: inline-block; flex: none; }
+.legend .mark { flex: none; display: block; }
 .legend .lbl em { color: var(--dim); font-style: normal; margin-right: 4px; }
 .legend b { color: var(--text); font-weight: 600; }
 .legend u { color: var(--dim); text-decoration: none; }

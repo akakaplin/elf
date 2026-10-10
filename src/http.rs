@@ -17,6 +17,13 @@ use crate::json::ToJson;
 
 /// Most bytes of request line and headers read before a request is refused.
 const MAX_HEAD: u64 = 16 * 1024;
+/// Sent with every response. The viewer is wholly same-origin -- vendored
+/// scripts, one stylesheet, `fetch` to its own API -- so nothing else may load.
+/// Inline `style=` set from script goes through the CSSOM, which `style-src`
+/// does not govern, so React's styling still works.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+                   connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; \
+                   frame-ancestors 'none'";
 /// How long a client may take to send its request, or leave a response unread.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -169,7 +176,8 @@ fn write_response(stream: TcpStream, response: Response, head_only: bool) -> io:
     let mut out = BufWriter::with_capacity(1 << 16, stream);
     write!(
         out,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Security-Policy: {CSP}\r\n\
+         X-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         response.status,
         reason(response.status),
         response.content_type
@@ -329,6 +337,20 @@ mod tests {
         assert!(request_from(b"GET / SPDY/3\r\n\r\n").is_err());
         let huge = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(MAX_HEAD as usize));
         assert!(request_from(huge.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn responses_carry_the_csp() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        write_response(server, Response::text(200, "ok"), false).unwrap();
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        let head = raw.split("\r\n\r\n").next().unwrap();
+        assert!(head.contains(&format!("\r\nContent-Security-Policy: {CSP}\r\n")));
+        assert!(head.contains("\r\nX-Content-Type-Options: nosniff\r\n"));
+        assert!(!CSP.contains("  "), "line continuation left padding in the policy");
     }
 
     #[test]

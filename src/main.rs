@@ -4,12 +4,14 @@
 //! request reads the raw store; aggregation, when the window is too dense to
 //! draw point-for-point, happens inside the query and never touches disk.
 
+mod coverage;
 mod db;
+mod duck;
+mod error;
 mod http;
 mod json;
 mod query;
 
-use anyhow::{anyhow, Result};
 use std::{
     ffi::OsString,
     io::{self, Write},
@@ -17,9 +19,13 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
     process,
+    sync::Arc,
+    thread,
+    time::Instant,
 };
 
 use crate::db::{Catalog, Db};
+use crate::error::{err, Result};
 use crate::http::{Request, Response};
 use crate::json::{Field, Object, ToJson};
 
@@ -28,13 +34,21 @@ use crate::json::{Field, Object, ToJson};
 /// configurable — it is the point past which a response stops being something a
 /// browser can hold, not a matter of taste.
 const MAX_POINTS_CEILING: i64 = 4_000_000;
-const MAX_POINTS_FLOOR: i64 = 1_000;
+const MAX_POINTS_FLOOR: i64 = 2_000;
 const DEFAULT_MAX_POINTS: i64 = 1_000_000;
+/// Bounds on the coverage probe's resolution. The floor keeps the span count
+/// near the store's length in seconds; the ceiling (a week) only keeps the
+/// conversion to microseconds from overflowing.
+const MIN_COVERAGE_BUCKET_MS: i64 = 1_000;
+const MAX_COVERAGE_BUCKET_MS: i64 = 7 * 24 * 3_600_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Most values one `/api/data` response may ever materialise.
     pub max_points_ceiling: i64,
+    /// Least budget one `/api/data` request is given, whatever it asks for. The
+    /// page needs it to split a viewport's budget without going under it.
+    pub min_points: i64,
     /// What a request gets if it names no budget of its own.
     pub default_max_points: i64,
     /// Channels one request may name.
@@ -45,6 +59,7 @@ impl ToJson for Limits {
     fn write_json<W: Write>(&self, w: &mut W) -> io::Result<()> {
         Object::new(w)?
             .field("max_points_ceiling", &self.max_points_ceiling)?
+            .field("min_points", &self.min_points)?
             .field("default_max_points", &self.default_max_points)?
             .field("max_channels", &self.max_channels)?
             .end()
@@ -69,7 +84,7 @@ const HELP: &str = concat!(
     "/web]\n",
     "      --host <HOST>                  [default: 127.0.0.1]\n",
     "      --port <PORT>                  [default: 8787]\n",
-    "      --max-channels <MAX_CHANNELS>  Channels a single request may name [default: 10]\n",
+    "      --max-channels <MAX_CHANNELS>  Channels a single request may name [default: 20]\n",
     "  -h, --help                         Print help\n",
     "  -V, --version                      Print version\n",
 );
@@ -122,7 +137,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<Parsed, String
     let mut web = PathBuf::from(DEFAULT_WEB);
     let mut host = "127.0.0.1".to_string();
     let mut port = 8787;
-    let mut max_channels = 10;
+    let mut max_channels = 20;
 
     let mut argv = argv.into_iter();
     while let Some(raw) = argv.next() {
@@ -186,6 +201,7 @@ fn main() -> Result<()> {
 
     let limits = Limits {
         max_points_ceiling: MAX_POINTS_CEILING,
+        min_points: MAX_POINTS_FLOOR,
         default_max_points: DEFAULT_MAX_POINTS,
         max_channels: args.max_channels.max(1),
     };
@@ -197,11 +213,24 @@ fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     let listener = TcpListener::bind(addr)?;
     eprintln!("elf: http://{addr}");
-    let app = App {
+    let app = Arc::new(App {
         db,
         limits,
         web: args.web,
-    };
+    });
+    // Read every file's coverage now rather than on the page's first load,
+    // while the server already answers. A request arriving first waits on the
+    // same lock and gets the finished answer.
+    let warm = Arc::clone(&app);
+    thread::Builder::new()
+        .name("elf-coverage".into())
+        .spawn(move || {
+            let started = Instant::now();
+            match warm.db.coverage.warm(&warm.db) {
+                Ok(()) => eprintln!("elf: coverage read in {:.1?}", started.elapsed()),
+                Err(e) => eprintln!("elf: coverage warm-up failed: {e}"),
+            }
+        })?;
     http::serve(listener, move |req| app.route(req))
 }
 
@@ -235,9 +264,21 @@ impl App {
     }
 
     fn coverage(&self, req: &Request) -> Result<query::Coverage> {
-        // Resolution at which occupancy is probed. Smaller finds smaller gaps.
+        // Resolution at which occupancy is probed. Smaller finds smaller gaps,
+        // and costs a span per bucket at worst, so it has a floor: below it one
+        // dense series alone answers with millions of spans.
         let bucket_ms = param(req, "bucket_ms")?.unwrap_or(60_000);
-        query::coverage(&self.db, bucket_ms.max(1) * 1_000)
+        // Per-series gaps this short are joined. The lanes those spans draw
+        // are a strip of pixels across the whole store, where a feed that
+        // prints every few seconds is otherwise a span per bucket -- 83,000 of
+        // them, 3 MB, for lines nobody can tell apart. The union, which the
+        // axis collapses gaps against, is never merged.
+        let merge_ms = param(req, "merge_ms")?.unwrap_or(0);
+        self.db.coverage.coverage(
+            &self.db,
+            bucket_ms.clamp(MIN_COVERAGE_BUCKET_MS, MAX_COVERAGE_BUCKET_MS) * 1_000,
+            merge_ms.clamp(0, MAX_COVERAGE_BUCKET_MS) * 1_000,
+        )
     }
 
     fn data(&self, req: &Request) -> Result<query::DataResponse> {
@@ -260,10 +301,10 @@ impl App {
             .map(str::to_string)
             .collect();
         if channels.is_empty() {
-            return Err(anyhow!("no channels requested"));
+            return Err(err!("no channels requested"));
         }
         if channels.len() > self.limits.max_channels {
-            return Err(anyhow!(
+            return Err(err!(
                 "at most {} channels per request, got {}",
                 self.limits.max_channels,
                 channels.len()
@@ -318,7 +359,7 @@ fn api<T: ToJson + 'static>(handler: impl FnOnce() -> Result<T>) -> Response {
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("unknown cause");
-        Err(anyhow!("task panicked: {msg}"))
+        Err(err!("task panicked: {msg}"))
     });
     match outcome {
         Ok(value) => Response::json(200, value),
@@ -330,12 +371,12 @@ fn api<T: ToJson + 'static>(handler: impl FnOnce() -> Result<T>) -> Response {
 /// error, not a quiet fallback to the default.
 fn param(req: &Request, key: &str) -> Result<Option<i64>> {
     req.param(key)
-        .map(|v| v.parse().map_err(|e| anyhow!("invalid `{key}` value `{v}`: {e}")))
+        .map(|v| v.parse().map_err(|e| err!("invalid `{key}` value `{v}`: {e}")))
         .transpose()
 }
 
-fn missing(key: &str) -> anyhow::Error {
-    anyhow!("missing query parameter `{key}`")
+fn missing(key: &str) -> error::Error {
+    err!("missing query parameter `{key}`")
 }
 
 #[cfg(test)]

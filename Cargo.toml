@@ -5,21 +5,27 @@ edition = "2021"
 description = "Multi-channel viewer over a raw orc parquet time-series store"
 
 [dependencies]
-anyhow = "1"
-duckdb = "1.10505.0"
+# DuckDB's C API and nothing else: elf runs SQL text and reads BIGINT, DOUBLE
+# and VARCHAR columns, which `src/duck.rs` wraps in a few dozen lines. The
+# `duckdb` crate on top of this brought about a hundred crates, Arrow most of
+# them, for an API elf did not use. No default features: `pkg-config` and
+# `vcpkg` only find a library, and both ways elf links one -- DUCKDB_LIB_DIR
+# locally, DUCKDB_DOWNLOAD_LIB in the Dockerfile -- are in the build script
+# without them. The version pins the DuckDB release, 1.5.5.
+libduckdb-sys = { version = "1.10505.0", default-features = false }
 
-# Size-tuned: 4.0 MB -> 1.9 MB. The heavy lifting is in libduckdb, which this
-# does not touch, so the only Rust-side hot path -- serialising a large raw
-# window -- measured within ~4% of opt-level 2. "z" is 360 KB smaller again but
-# ~45% slower there. panic = "abort" would save another 400 KB, but would turn
-# a panicking query from a 400 response into a dead server.
+# Size-tuned: about 450 KB. The heavy lifting is in libduckdb, which this does
+# not touch, so the only Rust-side hot path -- serialising a large raw window --
+# measured within ~4% of opt-level 2 (when the binary still carried the `duckdb`
+# crate; "z" was ~45% slower there). panic = "abort" would make it smaller still,
+# but would turn a panicking query from a 400 response into a dead server.
 [profile.release]
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
-# Debuginfo for our own crate only. Arrow alone is most of target/debug, and
-# nobody steps through it: 945 MB -> 434 MB on a clean build.
+# Debuginfo for our own crate only: nobody steps through a dependency, and its
+# debuginfo was most of target/debug while elf still pulled in Arrow.
 [profile.dev.package."*"]
 debug = false

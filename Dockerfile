@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-# glibc, not the musl-on-`scratch` the sibling `perpl` uses. The `duckdb` crate
+# glibc, not the musl-on-`scratch` the sibling `perpl` uses. `libduckdb-sys`
 # links a prebuilt DuckDB shared object, and the only Linux builds upstream
 # publishes are glibc ones. `distroless/cc` is the small end of what can load
 # it: glibc, libstdc++ and libgcc, and no shell.
 
-ARG RUST_VERSION=1.98.1
+# No default: ../build.sh passes the one version the whole workspace builds
+# and tests with.
+ARG RUST_VERSION
 ARG DEBIAN_VERSION=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
@@ -15,20 +17,17 @@ FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 # prebuilt libduckdb for the target triple at the version the crate encodes
 # (1.10505.0 -> DuckDB 1.5.5). This is an env var rather than a feature, so
 # `Cargo.lock` is untouched and `--locked` still means something. The
-# alternative, `--features duckdb/bundled`, compiles DuckDB from source: about
+# alternative, `--features libduckdb-sys/bundled`, compiles DuckDB from source: about
 # fifteen minutes, and it needs a lockfile update to pull in `cc`.
 ENV DUCKDB_DOWNLOAD_LIB=1
 
 # The release profile in Cargo.toml asks for fat LTO and one codegen unit.
-# `build.sh --fast` passes thin LTO and parallel codegen for local iteration;
-# the env vars outrank the manifest. Each setting gets its own target directory
-# inside the cache mount, so switching between the two does not throw away the
-# other's artifacts.
-ARG LTO=fat
-ARG CODEGEN_UNITS=1
-ENV CARGO_PROFILE_RELEASE_LTO=${LTO} \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CODEGEN_UNITS} \
-    CARGO_TARGET_DIR=/app/target/${LTO}
+# The image builds with thin LTO and parallel codegen instead; the env vars
+# outrank the manifest, so a local `cargo build --release` still gets the full
+# profile.
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+    CARGO_TARGET_DIR=/app/target
 
 # `/app`, not `/build`: `--web` defaults to `CARGO_MANIFEST_DIR/web` and that
 # path is baked in at compile time. Building here and putting the assets at

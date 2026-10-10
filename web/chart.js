@@ -97,9 +97,70 @@ function uOf(range, t) {
   return range.u0 + (t - range.from);
 }
 
-/// Radius of a sample mark in dot mode. Slightly wider than the 1.25px line so
-/// a single isolated reading is still visible.
-const DOT_R = 1.75;
+/// Half-extent of a sample mark in dot mode. Small, so a dense feed stays
+/// legible, but enough for a triangle's direction to read on its own.
+const MARK_R = 1.6;
+
+/// Shapes a column can be marked with in dot mode. `up` and `down` are kept for
+/// the two sides of a book; everything else is assigned from the rest.
+const OTHER_MARKS = ['circle', 'square', 'diamond', 'plus'];
+/// Columns common enough to get a fixed shape rather than risk sharing one by
+/// hash -- `price` and `size` often sit on the same chart.
+const NAMED_MARKS = Object.assign(Object.create(null), {
+  price: 'circle', px: 'circle', mid: 'circle', last: 'circle',
+  size: 'square', qty: 'square', amount: 'square',
+  bid_size: 'diamond', ask_size: 'plus',
+});
+
+/// The dot-mode mark for a channel, chosen by its column name alone, so `ask`
+/// looks the same whichever table it comes from: asks point down, bids up
+/// (`ask`, `ask1`, `ask_px`, …), and any other column gets a fixed shape hashed
+/// from its name -- stable across reloads and selections.
+export function markerFor(id) {
+  const field = id.slice(id.indexOf(':') + 1).toLowerCase();
+  if (/^ask(?:_?\d+|_?px|_?price)?$/.test(field)) return 'down';
+  if (/^bid(?:_?\d+|_?px|_?price)?$/.test(field)) return 'up';
+  if (field in NAMED_MARKS) return NAMED_MARKS[field];
+  let h = 0;
+  for (let i = 0; i < field.length; i++) h = (h * 31 + field.charCodeAt(i)) | 0;
+  return OTHER_MARKS[Math.abs(h) % OTHER_MARKS.length];
+}
+
+/// Adds one mark centred on (x, y) to the current path. Every shape is filled,
+/// so all of a channel's marks still go out in one `fill()`.
+function addMark(ctx, shape, x, y, r) {
+  switch (shape) {
+    case 'up':
+      ctx.moveTo(x, y - r * 1.2);
+      ctx.lineTo(x + r * 1.1, y + r * 0.8);
+      ctx.lineTo(x - r * 1.1, y + r * 0.8);
+      ctx.closePath();
+      break;
+    case 'down':
+      ctx.moveTo(x, y + r * 1.2);
+      ctx.lineTo(x + r * 1.1, y - r * 0.8);
+      ctx.lineTo(x - r * 1.1, y - r * 0.8);
+      ctx.closePath();
+      break;
+    case 'square':
+      ctx.rect(x - r * 0.85, y - r * 0.85, r * 1.7, r * 1.7);
+      break;
+    case 'diamond':
+      ctx.moveTo(x, y - r * 1.15);
+      ctx.lineTo(x + r * 1.15, y);
+      ctx.lineTo(x, y + r * 1.15);
+      ctx.lineTo(x - r * 1.15, y);
+      ctx.closePath();
+      break;
+    case 'plus':
+      ctx.rect(x - r * 1.2, y - r * 0.35, r * 2.4, r * 0.7);
+      ctx.rect(x - r * 0.35, y - r * 1.2, r * 0.7, r * 2.4);
+      break;
+    default:
+      ctx.moveTo(x + r * 0.8, y);
+      ctx.arc(x, y, r * 0.8, 0, Math.PI * 2);
+  }
+}
 
 // ------------------------------------------------------------------ charts --
 
@@ -235,6 +296,7 @@ function logScaleFor(extent) {
 }
 
 function drawChannel(ctx, { id, color, segments, xOf, yOf, u0, u1, lineStyle }) {
+  const shape = markerFor(id);
   for (const seg of segments) {
     const c = seg.byChannel[id];
     if (!c || !c.t || !c.t.length) continue;
@@ -265,9 +327,11 @@ function drawChannel(ctx, { id, color, segments, xOf, yOf, u0, u1, lineStyle }) 
       });
       ctx.globalAlpha = 1;
 
-      draw(ctx, color, t, c.last, gapUs, seg, xOf, yOf, lineStyle);
+      // The closing value goes where it was recorded. Breaks are still found
+      // from the bucket starts, whose spacing is regular.
+      draw(ctx, color, t, c.last, gapUs, seg, xOf, yOf, lineStyle, shape, c.tLast);
     } else if (c.v) {
-      draw(ctx, color, t, c.v, gapUs, seg, xOf, yOf, lineStyle);
+      draw(ctx, color, t, c.v, gapUs, seg, xOf, yOf, lineStyle, shape);
     }
   }
 }
@@ -292,9 +356,10 @@ function breakThreshold(t, bucketUs) {
   return Math.max(20 * median, 2000);
 }
 
-function draw(ctx, color, t, values, gapUs, seg, xOf, yOf, lineStyle) {
-  if (lineStyle === 'dot') strokeDots(ctx, color, t, values, seg, xOf, yOf);
-  else strokeLine(ctx, color, t, values, gapUs, seg, xOf, yOf, lineStyle === 'step');
+/// `tx`, when given, is where each value is placed; `t` still decides breaks.
+function draw(ctx, color, t, values, gapUs, seg, xOf, yOf, lineStyle, shape, tx = t) {
+  if (lineStyle === 'dot') strokeDots(ctx, color, tx, values, seg, xOf, yOf, shape);
+  else strokeLine(ctx, color, t, values, gapUs, seg, xOf, yOf, lineStyle === 'step', tx);
 }
 
 /// One mark per sample with nothing joining them -- for reading a feed as the
@@ -302,24 +367,21 @@ function draw(ctx, color, t, values, gapUs, seg, xOf, yOf, lineStyle) {
 /// where a line implies it did. Gap detection does not apply: with no joins
 /// there is nothing to break.
 ///
-/// Every dot goes into one path so a dense window costs a single fill instead
+/// Every mark goes into one path so a dense window costs a single fill instead
 /// of tens of thousands.
-function strokeDots(ctx, color, t, values, seg, xOf, yOf) {
+function strokeDots(ctx, color, t, values, seg, xOf, yOf, shape) {
   if (!values) return;
   ctx.fillStyle = color;
   ctx.beginPath();
   for (let i = 0; i < t.length; i++) {
     const v = values[i];
     if (v == null) continue;
-    const x = xOf(uOf(seg, t[i]));
-    const y = yOf(v);
-    ctx.moveTo(x + DOT_R, y);
-    ctx.arc(x, y, DOT_R, 0, Math.PI * 2);
+    addMark(ctx, shape, xOf(uOf(seg, t[i])), yOf(v), MARK_R);
   }
   ctx.fill();
 }
 
-function strokeLine(ctx, color, t, values, gapUs, seg, xOf, yOf, step) {
+function strokeLine(ctx, color, t, values, gapUs, seg, xOf, yOf, step, tx = t) {
   if (!values) return;
   ctx.strokeStyle = color;
   ctx.lineWidth = 1.25;
@@ -331,7 +393,7 @@ function strokeLine(ctx, color, t, values, gapUs, seg, xOf, yOf, step) {
     const v = values[i];
     if (v == null) { moved = false; continue; }
     if (i > 0 && t[i] - t[i - 1] > gapUs) moved = false;
-    const x = xOf(uOf(seg, t[i]));
+    const x = xOf(uOf(seg, tx[i]));
     const y = yOf(v);
     if (!moved) {
       ctx.moveTo(x, y);

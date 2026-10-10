@@ -15,6 +15,10 @@ comes from `series/**/*.parquet` at request time.
   rather than compiling DuckDB from source, which the `bundled` feature would
   spend about fifteen minutes doing.
 
+The only crate is `libduckdb-sys`, DuckDB's C API; `src/duck.rs` wraps the few
+calls the server makes. The `duckdb` crate on top of it brought about a hundred
+crates, Arrow most of them, for an API nothing here used.
+
 Point the build at it with a `.cargo/config.toml`. It is not in the repo,
 because it names a Homebrew prefix that is wrong on Intel Macs and on Linux:
 
@@ -43,7 +47,7 @@ cargo run -- --data /path/to/data
 | `--web`          | `<crate dir>/web` | Static assets                                       |
 | `--host`         | `127.0.0.1`       | Listen address                                      |
 | `--port`         | `8787`            | Listen port                                         |
-| `--max-channels` | `10`              | Channels one request may name                       |
+| `--max-channels` | `20`              | Channels one request may name                       |
 
 `--data` has no default: the viewer is not tied to one store, and silently
 opening someone else's is worse than saying nothing was named.
@@ -81,7 +85,7 @@ window up to the edge and stops, rather than squashing it.
 
 **Channels.** Every numeric column of every series is listed; click one to put
 it on a chart, click again to drop it. Selected rows carry the line's own
-colour. Ten can be up at once, after which the rest grey out.
+colour. Twenty can be up at once, after which the rest grey out.
 
 Clicking a drawn line — or its legend entry — hides it without unloading it:
 the data stays in the page, the chart keeps its place in the stack, and the
@@ -116,7 +120,10 @@ because until then "the last value" is a value that does not exist yet. That is
 what lets a formula span two series recorded at completely different rates.
 
 Where a window is bucketed rather than raw, each input contributes its bucket's
-closing value. The result is always drawn as a plain line and never as an
+closing value, entered at the time that value was recorded — the latest `ts` in
+the bucket — not at the bucket's start. Entered at the start, a bucketed input
+would be combined with a raw one's reading from up to a bucket earlier, a
+lookahead that shows up as a plausible but wrong spread. The result is always drawn as a plain line and never as an
 envelope: the low of `a - b` is not the low of `a` minus the low of `b`, so
 there is no honest envelope to draw.
 
@@ -124,7 +131,7 @@ The expression is parsed here, never `eval`'d — it travels in a URL, and a
 shared link must not be able to reach anything but the numbers it was given. A
 formula that does not parse keeps its place in the list carrying the parse
 error, so a half-typed expression does not make the row vanish underneath you.
-Inputs count against the same ten-channel request budget as drawn channels; the
+Inputs count against the same twenty-channel request budget as drawn channels; the
 count beside **Channels** is the total, and a link asking for more formulas than
 fit loses the ones that do not rather than failing the whole viewport.
 
@@ -144,8 +151,13 @@ it.
 | `line`  | Samples joined directly. Easier to read when the signal really is continuous. |
 | `dot`   | One mark per sample, nothing joining them. Shows where the feed reported rather than where a line implies it did, which is how you see a quiet stretch for what it is. |
 
+In `dot` mode the mark's shape comes from the column name, never the table, so
+`ask` looks the same in every series: asks are ▼, bids ▲ (`ask`, `ask1`,
+`bid_px`, …), `price` is a circle, `size` a square, and any other column gets a
+fixed shape from its name. The legend shows each line's mark.
+
 Where a window is bucketed, the mark or line follows each bucket's closing
-value; the min/max envelope is drawn regardless, since it describes the
+value, placed at the moment it was recorded; the min/max envelope is drawn regardless, since it describes the
 aggregation rather than the style.
 
 **Raw until it can't be.** When a window holds fewer rows than the raw budget
@@ -156,10 +168,15 @@ the first and last value per bucket, and says `agg · <bucket size>`.
 **Bounded memory.** The page picks a budget under the cog — how many values it
 is willing to hold for one viewport — and sends it with each request. Both the
 bucket count and the raw threshold are trimmed to fit, so no window, however
-wide and however many channels, pulls an unbounded result into memory; a
+wide and however many channels, pulls an unbounded result into memory. Within
+one request the budget is split across series, so a mix of raw and bucketed
+series cannot add up past it; a
 viewport spanning several bursts shares one allowance across its queries rather
 than each claiming the whole thing. The server clamps whatever it is handed to
-a 4,000,000-value ceiling, which is not configurable. The status bar shows what
+a 4,000,000-value ceiling, which is not configurable, and never gives one
+request less than 2,000; a viewport with more stretches than its budget can give
+that much each fetches neighbouring stretches together and cuts the answer back
+apart, rather than letting the floor push it over budget. The status bar shows what
 is currently held and turns amber when the budget trimmed the request.
 
 **The status bar** reads `window · utc  2026-08-10 00:33:30.000 → 7d 18:51:00.000`
@@ -198,12 +215,12 @@ Times are epoch microseconds, UTC. The `s=` payload is validated on the way in
 
 | Parameter    | Route       | Default   | Meaning                                                              |
 |:-------------|:------------|:----------|:---------------------------------------------------------------------|
-| `bucket_ms`  | `/coverage` | `60000`   | Resolution occupancy is probed at; smaller finds smaller gaps        |
+| `bucket_ms`  | `/coverage` | `60000`   | Resolution occupancy is probed at; smaller finds smaller gaps. Clamped to 1 s – 7 d |
 | `from`, `to` | `/data`     | —         | Window bounds, epoch microseconds UTC, half-open                     |
 | `channels`   | `/data`     | —         | Comma-separated `<series>:<field>`, up to `--max-channels`           |
 | `buckets`    | `/data`     | `1200`    | Target bucket count when aggregating; trimmed to `max_points`        |
 | `max_raw`    | `/data`     | `12000`   | Below this many rows the window is served raw; likewise trimmed      |
-| `max_points` | `/data`     | `1000000` | Values this response may materialise; clamped to a 4,000,000 ceiling |
+| `max_points` | `/data`     | `1000000` | Values this response may materialise; clamped to 2,000 – 4,000,000   |
 
 `/api/data` reports what it decided:
 
@@ -212,6 +229,9 @@ Times are epoch microseconds, UTC. The `s=` payload is validated on the way in
 | `buckets`, `max_raw` | What was actually used, after the point budget had its say |
 | `points`             | Values this response carries — what it costs to hold       |
 | `capped`             | `true` when the budget reduced either of the above         |
+
+A bucketed series carries `t` (bucket starts, for the envelope) and `t_last`
+(the latest `ts` in each bucket, when its `last` value was recorded).
 
 Times are epoch microseconds, UTC. Formulas are not part of this API: they are
 computed in the page from channels it already fetched, because their inputs
@@ -226,6 +246,8 @@ needs is the step-function hold described above.
 | `src/http.rs`     | HTTP/1.1 server and static files, standard library only |
 | `src/json.rs`     | JSON writer the responses stream through              |
 | `src/db.rs`       | Connection pool, view creation, catalog discovery     |
+| `src/duck.rs`     | DuckDB's C API: connections, queries, typed column reads |
+| `src/error.rs`    | The one error type, a message                         |
 | `src/query.rs`    | Coverage and windowed reads, point budget             |
 | `web/timeaxis.js` | The gap-collapsing axis, tick and duration formatting |
 | `web/scales.js`   | Value ranges, cluster detection, y-axis ticks         |
